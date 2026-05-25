@@ -43,6 +43,7 @@ The report opens in your browser automatically. It covers:
 - **What's Working** with your most impressive workflows
 - **Friction Analysis** categorized by type with concrete examples
 - **Suggestions** including config additions, features to try, and usage patterns with copyable prompts
+- **Model Efficiency** analysis showing overspend (expensive models on simple tasks), underspend (cheap models failing on complex work), cost breakdown by model, and estimated waste
 - **On the Horizon** for ambitious future workflows as models improve
 
 ### Flags
@@ -71,8 +72,8 @@ The pipeline runs in five phases:
 
 1. **Scan** all Pi session log files
 2. **Extract stats** deterministically from each session (tool counts, tokens, languages, git activity, response times)
-3. **LLM facet extraction** per session using a cheap model (Haiku) to classify goals, outcomes, satisfaction, and friction
-4. **Aggregate and generate insights** using 7 parallel insight prompts plus a synthesis prompt on your active model
+3. **LLM facet extraction** per session to classify goals, outcomes, satisfaction, and friction
+4. **Aggregate and generate insights** using 8 parallel insight prompts (including model efficiency) plus a synthesis prompt
 5. **Render** a self-contained HTML report with charts, cards, and copyable suggestions
 
 Results are cached in `~/.pi/agent/usage-data/`:
@@ -86,8 +87,7 @@ Results are cached in `~/.pi/agent/usage-data/`:
 ## Requirements
 
 - [Pi](https://github.com/earendil-works/pi) v0.74.0 or later
-- An active model configured in Pi (used for insight generation)
-- Optionally, access to Claude Haiku (via Bedrock or Anthropic API) for cheaper facet extraction. Falls back to your active model if unavailable.
+- An active model configured in Pi (used for both facet extraction and insight generation)
 
 ## License
 

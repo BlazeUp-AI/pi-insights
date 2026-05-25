@@ -19,7 +19,7 @@
  *   report.html              last generated report
  */
 
-import { complete, getModel } from "@earendil-works/pi-ai";
+import { complete } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -183,6 +183,7 @@ type SessionMeta = {
 	files_modified: number;
 	message_hours: number[];
 	user_message_timestamps: string[];
+	model_usage: Record<string, { input_tokens: number; output_tokens: number; cost: number; message_count: number }>;
 };
 
 type SessionFacets = {
@@ -248,6 +249,19 @@ type AggregatedData = {
 		sessions_involved: number;
 		user_messages_during: number;
 	};
+	model_usage: Record<string, { input_tokens: number; output_tokens: number; cost: number; message_count: number; sessions: number }>;
+	model_efficiency: Array<{
+		model: string;
+		session_id: string;
+		date: string;
+		cost: number;
+		outcome: string;
+		session_type: string;
+		goal: string;
+		flag: "overspend" | "underspend" | "ok";
+		reason: string;
+	}>;
+	estimated_waste: number;
 };
 
 // ─── Cache Utilities ──────────────────────────────────────────────────────────
@@ -395,6 +409,8 @@ function extractSessionStats(entries: AnyEntry[], sessionPath: string) {
 	let assistantMessageCount = 0;
 	let firstPrompt = "";
 
+	const modelUsage: Record<string, { input_tokens: number; output_tokens: number; cost: number; message_count: number }> = {};
+
 	let lastAssistantTs: number | null = null;
 
 	// Deduplicate tool call IDs to avoid double-counting branched entries
@@ -412,13 +428,26 @@ function extractSessionStats(entries: AnyEntry[], sessionPath: string) {
 			assistantMessageCount++;
 			if (msgTs) lastAssistantTs = msgTs;
 
+			// Model tracking
+			const modelName = (msg.model as string) ?? "unknown";
+
 			// Tokens + cost
 			const usage = msg.usage as Record<string, unknown> | undefined;
 			if (usage) {
-				inputTokens += (usage.input as number) ?? 0;
-				outputTokens += (usage.output as number) ?? 0;
+				const msgInput = (usage.input as number) ?? 0;
+				const msgOutput = (usage.output as number) ?? 0;
 				const cost = usage.cost as Record<string, number> | undefined;
-				if (cost?.total) totalCost += cost.total;
+				const msgCost = cost?.total ?? 0;
+
+				inputTokens += msgInput;
+				outputTokens += msgOutput;
+				if (msgCost) totalCost += msgCost;
+
+				if (!modelUsage[modelName]) modelUsage[modelName] = { input_tokens: 0, output_tokens: 0, cost: 0, message_count: 0 };
+				modelUsage[modelName]!.input_tokens += msgInput;
+				modelUsage[modelName]!.output_tokens += msgOutput;
+				modelUsage[modelName]!.cost += msgCost;
+				modelUsage[modelName]!.message_count++;
 			}
 
 			// Tool calls inside content
@@ -556,6 +585,7 @@ function extractSessionStats(entries: AnyEntry[], sessionPath: string) {
 		userMessageCount,
 		assistantMessageCount,
 		firstPrompt,
+		modelUsage,
 	};
 }
 
@@ -599,6 +629,7 @@ function buildSessionMeta(
 		files_modified: stats.filesModified,
 		message_hours: stats.messageHours,
 		user_message_timestamps: stats.userMessageTimestamps,
+		model_usage: stats.modelUsage,
 	};
 }
 
@@ -767,6 +798,9 @@ function aggregateData(
 			sessions_involved: 0,
 			user_messages_during: 0,
 		},
+		model_usage: {},
+		model_efficiency: [],
+		estimated_waste: 0,
 	};
 
 	const dates: string[] = [];
@@ -792,6 +826,16 @@ function aggregateData(
 		agg.message_hours.push(...meta.message_hours);
 		if (meta.uses_subagent) agg.sessions_using_subagent++;
 		if (meta.uses_mcp) agg.sessions_using_mcp++;
+
+		// Aggregate per-model usage
+		for (const [model, usage] of Object.entries(meta.model_usage ?? {})) {
+			if (!agg.model_usage[model]) agg.model_usage[model] = { input_tokens: 0, output_tokens: 0, cost: 0, message_count: 0, sessions: 0 };
+			agg.model_usage[model]!.input_tokens += usage.input_tokens;
+			agg.model_usage[model]!.output_tokens += usage.output_tokens;
+			agg.model_usage[model]!.cost += usage.cost;
+			agg.model_usage[model]!.message_count += usage.message_count;
+			agg.model_usage[model]!.sessions++;
+		}
 
 		if (meta.start_time) {
 			dates.push(meta.start_time);
@@ -860,53 +904,102 @@ function aggregateData(
 		})),
 	);
 
+	// Model efficiency analysis
+	const MODEL_TIERS: Record<string, "high" | "mid" | "low"> = {};
+	const classifyModel = (name: string): "high" | "mid" | "low" => {
+		if (MODEL_TIERS[name]) return MODEL_TIERS[name]!;
+		const n = name.toLowerCase();
+		if (n.includes("opus") || n.includes("o1") || n.includes("o3")) {
+			MODEL_TIERS[name] = "high";
+		} else if (n.includes("haiku") || n.includes("flash") || n.includes("mini") || n.includes("gpt-4o-mini")) {
+			MODEL_TIERS[name] = "low";
+		} else {
+			MODEL_TIERS[name] = "mid";
+		}
+		return MODEL_TIERS[name]!;
+	};
+
+	const COMPLEX_TYPES = new Set(["multi_task", "iterative_refinement"]);
+	const SIMPLE_TYPES = new Set(["quick_question", "single_task"]);
+
+	let estimatedWaste = 0;
+
+	for (const meta of metas) {
+		const facets = facetsMap.get(meta.session_id);
+		if (!facets) continue;
+
+		// Determine primary model (highest cost or most messages)
+		const models = Object.entries(meta.model_usage ?? {});
+		if (!models.length) continue;
+		const primaryModel = models.sort((a, b) => b[1].cost - a[1].cost)[0]!;
+		const [modelName, modelStats] = primaryModel;
+		const tier = classifyModel(modelName);
+
+		const isSimple = SIMPLE_TYPES.has(facets.session_type)
+			|| (meta.user_message_count <= 3 && meta.duration_minutes < 5);
+		const isComplex = COMPLEX_TYPES.has(facets.session_type)
+			|| meta.user_message_count > 8
+			|| meta.files_modified > 5;
+		const poorOutcome = facets.outcome === "not_achieved" || facets.outcome === "partially_achieved";
+		const goodOutcome = facets.outcome === "fully_achieved" || facets.outcome === "mostly_achieved";
+
+		let flag: "overspend" | "underspend" | "ok" = "ok";
+		let reason = "";
+
+		// Overspend: expensive model on simple task
+		if (tier === "high" && isSimple && goodOutcome) {
+			flag = "overspend";
+			reason = `Used ${modelName} for a simple ${facets.session_type} that completed successfully. A cheaper model would likely suffice.`;
+			estimatedWaste += modelStats.cost * 0.8;
+		}
+		// Underspend: cheap model on complex task with poor outcome
+		else if (tier === "low" && isComplex && poorOutcome) {
+			flag = "underspend";
+			reason = `Used ${modelName} for a complex ${facets.session_type} that ended with ${facets.outcome}. A stronger model may have succeeded.`;
+			estimatedWaste += modelStats.cost;
+		}
+		// Overspend: expensive model on ANY task with poor outcome (wasted tokens)
+		else if (tier === "high" && poorOutcome && modelStats.cost > 0.10) {
+			flag = "overspend";
+			reason = `Spent $${modelStats.cost.toFixed(2)} on ${modelName} but outcome was ${facets.outcome}. Tokens were burned without reaching the goal.`;
+			estimatedWaste += modelStats.cost * 0.5;
+		}
+
+		if (flag !== "ok") {
+			agg.model_efficiency.push({
+				model: modelName,
+				session_id: meta.session_id,
+				date: meta.start_time.slice(0, 10),
+				cost: modelStats.cost,
+				outcome: facets.outcome,
+				session_type: facets.session_type,
+				goal: facets.underlying_goal?.slice(0, 80) ?? "",
+				flag,
+				reason,
+			});
+		}
+	}
+
+	agg.estimated_waste = estimatedWaste;
+	agg.model_efficiency.sort((a, b) => b.cost - a.cost);
+	agg.model_efficiency = agg.model_efficiency.slice(0, 20);
+
 	return agg;
 }
 
 // ─── LLM Calling ─────────────────────────────────────────────────────────────
 
-// Haiku candidates in preference order: Bedrock eu/us/global, then Anthropic direct
-const HAIKU_CANDIDATES: Array<[string, string]> = [
-	["amazon-bedrock", "eu.anthropic.claude-haiku-4-5-20251001-v1:0"],
-	["amazon-bedrock", "us.anthropic.claude-haiku-4-5-20251001-v1:0"],
-	["amazon-bedrock", "anthropic.claude-3-5-haiku-20241022-v1:0"],
-	["anthropic",      "claude-haiku-4-5"],
-	["anthropic",      "claude-3-5-haiku-20241022"],
-];
-
-type ResolvedModel = { model: unknown; apiKey: string; headers?: Record<string, string> };
-
-async function resolveHaikuModel(ctx: ExtensionCommandContext): Promise<ResolvedModel | null> {
-	for (const [provider, modelId] of HAIKU_CANDIDATES) {
-		try {
-			const m = getModel(provider as never, modelId as never);
-			if (!m) continue;
-			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(m);
-			if (auth.ok && auth.apiKey) return { model: m, apiKey: auth.apiKey, headers: auth.headers };
-		} catch { /* try next */ }
-	}
-	return null;
-}
-
 async function callModel(
 	ctx: ExtensionCommandContext,
 	prompt: string,
-	maxTokens?: number,
-	modelOverride?: ResolvedModel | null,
+	_maxTokens?: number,
 ): Promise<string> {
-	const model = modelOverride?.model ?? ctx.model;
+	const model = ctx.model;
 	if (!model) throw new Error("No active model");
-	let apiKey: string;
-	let headers: Record<string, string> | undefined;
-	if (modelOverride) {
-		apiKey = modelOverride.apiKey;
-		headers = modelOverride.headers;
-	} else {
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model as never);
-		if (!auth.ok) throw new Error(auth.error);
-		apiKey = auth.apiKey ?? "";
-		headers = auth.headers;
-	}
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model as never);
+	if (!auth.ok) throw new Error(auth.error);
+	const apiKey = auth.apiKey ?? "";
+	const headers = auth.headers;
 
 	const response = await complete(
 		model as never,
@@ -1004,6 +1097,9 @@ function buildSharedDataBlock(agg: AggregatedData): string {
 				multi_clauding: agg.multi_clauding,
 				subagent_sessions: agg.sessions_using_subagent,
 				mcp_sessions: agg.sessions_using_mcp,
+				model_usage: agg.model_usage,
+				model_efficiency_flags: agg.model_efficiency.length,
+				estimated_waste_usd: agg.estimated_waste.toFixed(2),
 			},
 			null,
 			2,
@@ -1176,6 +1272,25 @@ RESPOND WITH ONLY A VALID JSON OBJECT:
 }
 
 Find something interesting or amusing. Avoid generic observations.
+
+DATA:
+${data}`,
+
+		model_efficiency: `Analyze this model usage data and identify efficiency issues.
+
+Model tiers:
+- HIGH cost: Opus, o1, o3 (best quality, most expensive)
+- MID cost: Sonnet, GPT-4o, Gemini Pro (good balance)
+- LOW cost: Haiku, Flash, Mini (cheap, less capable)
+
+RESPOND WITH ONLY A VALID JSON OBJECT:
+{
+  "summary": "2-3 sentences summarizing model usage efficiency. Use 'you'. Be direct about waste.",
+  "overspend_pattern": "1-2 sentences about when expensive models are used unnecessarily, or empty string if none",
+  "underspend_pattern": "1-2 sentences about when cheap models fail on complex tasks, or empty string if none",
+  "recommendation": "1-2 sentences with a specific model selection strategy for this user",
+  "potential_savings_note": "1 sentence about how much could be saved with better model selection"
+}
 
 DATA:
 ${data}`,
@@ -1431,6 +1546,9 @@ function generateHTML(
 	const funSec = sections.fun_ending as
 		| { headline?: string; detail?: string }
 		| undefined;
+	const modelEffSec = sections.model_efficiency as
+		| { summary?: string; overspend_pattern?: string; underspend_pattern?: string; recommendation?: string; potential_savings_note?: string }
+		| undefined;
 
 	const topTools = top8(agg.tool_counts);
 	const topGoals = top8(agg.goal_categories);
@@ -1578,6 +1696,7 @@ function generateHTML(
   <a href="#friction">Friction</a>
   <a href="#suggestions">Suggestions</a>
   <a href="#horizon">On the Horizon</a>
+  <a href="#model-efficiency">Model Efficiency</a>
 </nav>
 
 <!-- ── At a Glance ── -->
@@ -1816,6 +1935,61 @@ function generateHTML(
   </div>
 </section>
 
+<!-- ── Model Efficiency ── -->
+<section id="model-efficiency">
+  <h2><span class="emoji">⚡</span> Model Efficiency</h2>
+  ${modelEffSec?.summary ? `<p style="color:var(--dim);margin-bottom:16px">${esc(modelEffSec.summary)}</p>` : ""}
+
+  <div class="stat-grid">
+    ${statCard("Estimated Waste", fmtCost(agg.estimated_waste), "from model mismatch")}
+    ${statCard("Efficiency Flags", String(agg.model_efficiency.length), `${agg.model_efficiency.filter(e => e.flag === "overspend").length} overspend, ${agg.model_efficiency.filter(e => e.flag === "underspend").length} underspend`)}
+    ${statCard("Models Used", String(Object.keys(agg.model_usage).length), "")}
+  </div>
+
+  <div class="charts-grid">
+    <div class="chart-box">
+      <h3>Cost by Model</h3>
+      ${barChart(Object.fromEntries(Object.entries(agg.model_usage).map(([k, v]) => [k, Math.round(v.cost * 100)])), { limit: 8 })}
+      <p class="muted" style="margin-top:8px;font-size:11px">Values in cents</p>
+    </div>
+    <div class="chart-box">
+      <h3>Messages by Model</h3>
+      ${barChart(Object.fromEntries(Object.entries(agg.model_usage).map(([k, v]) => [k, v.message_count])), { limit: 8 })}
+    </div>
+  </div>
+
+  ${modelEffSec?.overspend_pattern ? `<div class="card" style="margin-top:16px;border-left:3px solid var(--yellow)">
+    <h3 style="color:var(--yellow);font-size:14px">Overspend Pattern</h3>
+    <p style="color:var(--dim);margin-top:8px">${esc(modelEffSec.overspend_pattern)}</p>
+  </div>` : ""}
+
+  ${modelEffSec?.underspend_pattern ? `<div class="card" style="margin-top:12px;border-left:3px solid var(--red)">
+    <h3 style="color:var(--red);font-size:14px">Underspend Pattern</h3>
+    <p style="color:var(--dim);margin-top:8px">${esc(modelEffSec.underspend_pattern)}</p>
+  </div>` : ""}
+
+  ${modelEffSec?.recommendation ? `<div class="card" style="margin-top:12px;border-left:3px solid var(--green)">
+    <h3 style="color:var(--green);font-size:14px">Recommendation</h3>
+    <p style="color:var(--dim);margin-top:8px">${esc(modelEffSec.recommendation)}</p>
+    ${modelEffSec.potential_savings_note ? `<p style="color:var(--muted);margin-top:6px;font-size:12px;font-style:italic">${esc(modelEffSec.potential_savings_note)}</p>` : ""}
+  </div>` : ""}
+
+  ${agg.model_efficiency.length ? `<h3 style="margin-top:24px;margin-bottom:12px">Flagged Sessions</h3>
+  <div style="display:flex;flex-direction:column;gap:8px">
+    ${agg.model_efficiency.slice(0, 10).map(e => `<div class="card" style="padding:14px 18px">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <span class="badge ${e.flag === "overspend" ? "yellow" : "red"}">${esc(e.flag)}</span>
+          <span style="color:var(--dim);font-size:13px;margin-left:8px">${esc(e.date)} · ${esc(e.model)}</span>
+        </div>
+        <span style="color:var(--accent);font-weight:600;font-size:14px">${fmtCost(e.cost)}</span>
+      </div>
+      <p style="color:var(--dim);font-size:13px;margin-top:6px">${esc(e.reason)}</p>
+      <p style="color:var(--muted);font-size:12px;margin-top:4px">${esc(e.goal)}</p>
+    </div>`).join("\n")}
+  </div>` : ""}
+</section>
+
 <!-- ── Fun Ending ── -->
 ${
 	funSec?.headline
@@ -1981,12 +2155,6 @@ async function runInsights(
 	]);
 
 	// ── Phase 3: Facet Extraction ─────────────────────────────────────────────────
-	// Haiku for cheap per-session extraction; active model for narrative prompts
-	const haikuAuth = await resolveHaikuModel(ctx);
-	if (haikuAuth) {
-		ctx.ui.notify(`Facets → ${(haikuAuth.model as { id?: string }).id ?? "haiku"} · insights → active model`, "info");
-	}
-
 	const facetsMap = new Map<string, SessionFacets>();
 
 	// Load cached facets
@@ -2023,7 +2191,7 @@ async function runInsights(
 								chunks.push(transcript.slice(ci, ci + CHUNK));
 							const summaries = await Promise.all(
 								chunks.map((ch) =>
-									callModel(ctx, CHUNK_SUMMARIZE_PROMPT + ch, 500, haikuAuth).catch(() =>
+									callModel(ctx, CHUNK_SUMMARIZE_PROMPT + ch, 500).catch(() =>
 										ch.slice(0, 2000),
 									),
 								),
@@ -2048,7 +2216,7 @@ RESPOND WITH ONLY A VALID JSON OBJECT:
   "user_instructions_to_assistant": ["instruction1", "instruction2"]
 }`;
 
-						const text = await callModel(ctx, prompt, 4096, haikuAuth);
+						const text = await callModel(ctx, prompt, 4096);
 						const parsed = parseJsonFromResponse(text) as SessionFacets | null;
 						if (parsed?.brief_summary) {
 							const facets: SessionFacets = {
