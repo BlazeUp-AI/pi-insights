@@ -68,6 +68,8 @@ Most Pi insight extensions dump flat aggregates into an LLM prompt and get the s
 |------|-------------|
 | `--refresh` / `-r` | Invalidate all cached LLM facet extractions and re-run them |
 | `--no-open` | Generate the report without opening it in the browser |
+| `--since <N>d` | Only analyze sessions from the last N days (e.g. `--since 7d`) |
+| `--md` | Output a Markdown report instead of opening the HTML version |
 
 ### Examples
 
@@ -80,6 +82,12 @@ Most Pi insight extensions dump flat aggregates into an LLM prompt and get the s
 
 # Generate without auto-opening
 /pi-insights --no-open
+
+# Only analyze the last 7 days
+/pi-insights --since 7d
+
+# Export as Markdown (for Slack, docs, etc.)
+/pi-insights --md
 ```
 
 ## How It Works

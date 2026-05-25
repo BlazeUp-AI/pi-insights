@@ -39,6 +39,7 @@ const DATA_DIR = join(homedir(), ".pi", "agent", "usage-data");
 const FACETS_DIR = join(DATA_DIR, "facets");
 const META_DIR = join(DATA_DIR, "session-meta");
 const REPORT_PATH = join(DATA_DIR, "report.html");
+const REPORT_MD_PATH = join(DATA_DIR, "report.md");
 
 const MAX_SESSIONS_TO_LOAD = 200;
 const MAX_FACET_EXTRACTIONS = 50;
@@ -966,6 +967,25 @@ function aggregateData(
 	const dates: string[] = [];
 	const activeDays = new Set<string>();
 
+	// Decay weighting: half-life of 10 days for facet-derived charts
+	const latestTs = metas.reduce((max, m) => {
+		const t = new Date(m.start_time).getTime();
+		return t > max ? t : max;
+	}, 0);
+	const HALF_LIFE_MS = 10 * 86400000;
+	const LAMBDA = Math.log(2) / HALF_LIFE_MS;
+
+	function decayWeight(meta: SessionMeta): number {
+		const age = latestTs - new Date(meta.start_time).getTime();
+		return Math.exp(-LAMBDA * age);
+	}
+
+	function mergeWeighted(target: Record<string, number>, source: Record<string, number>, weight: number) {
+		for (const [k, v] of Object.entries(source)) {
+			target[k] = (target[k] ?? 0) + v * weight;
+		}
+	}
+
 	for (const meta of metas) {
 		agg.total_messages += meta.user_message_count;
 		agg.total_duration_hours += meta.duration_minutes / 60;
@@ -1010,20 +1030,21 @@ function aggregateData(
 		const facets = facetsMap.get(meta.session_id);
 		if (facets) {
 			agg.sessions_with_facets++;
-			mergeRecord(agg.goal_categories, facets.goal_categories);
+			const w = decayWeight(meta);
+			mergeWeighted(agg.goal_categories, facets.goal_categories, w);
 			if (facets.outcome)
-				agg.outcomes[facets.outcome] = (agg.outcomes[facets.outcome] ?? 0) + 1;
-			mergeRecord(agg.satisfaction, facets.user_satisfaction_counts);
+				agg.outcomes[facets.outcome] = (agg.outcomes[facets.outcome] ?? 0) + w;
+			mergeWeighted(agg.satisfaction, facets.user_satisfaction_counts, w);
 			if (facets.assistant_helpfulness)
 				agg.helpfulness[facets.assistant_helpfulness] =
-					(agg.helpfulness[facets.assistant_helpfulness] ?? 0) + 1;
+					(agg.helpfulness[facets.assistant_helpfulness] ?? 0) + w;
 			if (facets.session_type)
 				agg.session_types[facets.session_type] =
-					(agg.session_types[facets.session_type] ?? 0) + 1;
-			mergeRecord(agg.friction, facets.friction_counts);
+					(agg.session_types[facets.session_type] ?? 0) + w;
+			mergeWeighted(agg.friction, facets.friction_counts, w);
 			if (facets.primary_success && facets.primary_success !== "none") {
 				agg.success[facets.primary_success] =
-					(agg.success[facets.primary_success] ?? 0) + 1;
+					(agg.success[facets.primary_success] ?? 0) + w;
 			}
 			agg.session_summaries.push({
 				id: meta.session_id.slice(0, 8),
@@ -1580,7 +1601,7 @@ function barChart(
 			return `<div class="bar-row">
   <div class="bar-label">${esc(displayLabel(key))}</div>
   <div class="bar-track"><div class="bar-fill" style="width:${pct.toFixed(1)}%"></div></div>
-  <div class="bar-count">${val}</div>
+  <div class="bar-count">${Math.round(val)}</div>
 </div>`;
 		})
 		.join("\n");
@@ -1660,6 +1681,126 @@ function fmtTokens(n: number): string {
 function fmtCost(n: number): string {
 	if (n < 0.01) return `<$0.01`;
 	return `$${n.toFixed(2)}`;
+}
+
+function generateMarkdown(
+	agg: AggregatedData,
+	sections: Record<string, unknown>,
+	synthesis: Record<string, string>,
+	temporal: TemporalData,
+): string {
+	const lines: string[] = [];
+	lines.push("# Pi Insights");
+	lines.push(`> ${agg.date_range.start} to ${agg.date_range.end} | ${agg.total_sessions} sessions | Generated ${new Date().toLocaleDateString()}`);
+	lines.push("");
+
+	if (temporal.diff_headlines.length) {
+		lines.push("## \u{1F4C8} What Changed This Week");
+		for (const h of temporal.diff_headlines) lines.push(`- ${h}`);
+		if (temporal.major_transition) lines.push(`- **Major shift (${temporal.major_transition.when}):** ${temporal.major_transition.what}. ${temporal.major_transition.impact}`);
+		lines.push("");
+	}
+
+	lines.push("## \u26A1 Summary");
+	if (synthesis.whats_working) lines.push(`**What's working:** ${synthesis.whats_working}`);
+	if (synthesis.whats_hindering) lines.push(`\n**What's hindering you:** ${synthesis.whats_hindering}`);
+	if (synthesis.quick_wins) lines.push(`\n**Quick wins:** ${synthesis.quick_wins}`);
+	if (synthesis.ambitious_workflows) lines.push(`\n**Ambitious workflows:** ${synthesis.ambitious_workflows}`);
+	lines.push("");
+
+	lines.push("## \u{1F4CA} By the Numbers");
+	lines.push(`| Metric | Value |`);
+	lines.push(`|--------|-------|`);
+	lines.push(`| Sessions | ${agg.total_sessions} (${agg.days_active} active days) |`);
+	lines.push(`| Messages | ${agg.total_messages} |`);
+	lines.push(`| Total Cost | $${agg.total_cost.toFixed(2)} |`);
+	lines.push(`| Tokens In | ${fmtTokens(agg.total_input_tokens)} |`);
+	lines.push(`| Tokens Out | ${fmtTokens(agg.total_output_tokens)} |`);
+	lines.push(`| Lines Added | ${agg.total_lines_added} |`);
+	lines.push(`| Git Commits | ${agg.git_commits} |`);
+	lines.push(`| Tool Errors | ${agg.total_tool_errors} |`);
+	lines.push("");
+
+	const areas = (sections.project_areas as { areas?: Array<{ name: string; session_count: number; description: string }> })?.areas ?? [];
+	if (areas.length) {
+		lines.push("## \u{1F5C2}\uFE0F Where You Worked");
+		for (const a of areas) lines.push(`- **${a.name}** (${a.session_count} sessions): ${a.description}`);
+		lines.push("");
+	}
+
+	const iStyle = sections.interaction_style as { narrative?: string; key_pattern?: string } | undefined;
+	if (iStyle?.narrative) {
+		lines.push("## \u{1F3AF} How You Work");
+		lines.push(iStyle.narrative);
+		if (iStyle.key_pattern) lines.push(`\n> ${iStyle.key_pattern}`);
+		lines.push("");
+	}
+
+	const whatWorks = sections.what_works as { impressive_workflows?: Array<{ title: string; description: string }> } | undefined;
+	if (whatWorks?.impressive_workflows?.length) {
+		lines.push("## \u2728 Wins");
+		for (const w of whatWorks.impressive_workflows) lines.push(`- **${w.title}**: ${w.description}`);
+		lines.push("");
+	}
+
+	const frictionSec = sections.friction_analysis as { intro?: string; resolved?: Array<{ category: string; note: string }>; ongoing?: Array<{ category: string; description: string; examples: string[] }>; categories?: Array<{ category: string; description: string; examples: string[] }> } | undefined;
+	if (frictionSec) {
+		lines.push("## \u26A0\uFE0F Where Things Broke");
+		if (frictionSec.intro) lines.push(frictionSec.intro);
+		if (frictionSec.resolved?.length) {
+			lines.push("\n**Resolved:**");
+			for (const r of frictionSec.resolved) lines.push(`- \u2705 ${r.category}: ${r.note}`);
+		}
+		const ongoing = frictionSec.ongoing ?? frictionSec.categories ?? [];
+		if (ongoing.length) {
+			lines.push("\n**Ongoing:**");
+			for (const o of ongoing) {
+				lines.push(`- **${o.category}**: ${o.description}`);
+				for (const ex of o.examples ?? []) lines.push(`  - ${ex}`);
+			}
+		}
+		lines.push("");
+	}
+
+	const suggSec = sections.suggestions as { config_additions?: Array<{ addition: string; why: string; where: string }>; features_to_try?: Array<{ feature: string; why_for_you: string; example: string }>; usage_patterns?: Array<{ title: string; detail: string; copyable_prompt: string }>; stop_doing?: Array<{ what: string; why: string; alternative: string }> } | undefined;
+	if (suggSec) {
+		lines.push("## \u{1F4A1} Next Steps");
+		if (suggSec.config_additions?.length) {
+			lines.push("**Config additions:**");
+			for (const c of suggSec.config_additions) lines.push(`- \`${c.where}\`: ${c.addition} (${c.why})`);
+		}
+		if (suggSec.features_to_try?.length) {
+			lines.push("\n**Features to try:**");
+			for (const f of suggSec.features_to_try) lines.push(`- **${f.feature}**: ${f.why_for_you}\n  \`\`\`\n  ${f.example}\n  \`\`\``);
+		}
+		if (suggSec.usage_patterns?.length) {
+			lines.push("\n**Usage patterns:**");
+			for (const p of suggSec.usage_patterns) lines.push(`- **${p.title}**: ${p.detail}\n  \`\`\`\n  ${p.copyable_prompt}\n  \`\`\``);
+		}
+		if (suggSec.stop_doing?.length) {
+			lines.push("\n**\u{1F6D1} Stop doing:**");
+			for (const s of suggSec.stop_doing) lines.push(`- **${s.what}**: ${s.why}. Instead: ${s.alternative}`);
+		}
+		lines.push("");
+	}
+
+	const horizonSec = sections.on_the_horizon as { opportunities?: Array<{ title: string; whats_possible: string; copyable_prompt: string }> } | undefined;
+	if (horizonSec?.opportunities?.length) {
+		lines.push("## \u{1F680} Future Workflows");
+		for (const o of horizonSec.opportunities) lines.push(`- **${o.title}**: ${o.whats_possible}\n  \`\`\`\n  ${o.copyable_prompt}\n  \`\`\``);
+		lines.push("");
+	}
+
+	lines.push("## \u{1F4B8} Model Spend");
+	lines.push(`| Model | Cost | Messages |`);
+	lines.push(`|-------|------|----------|`);
+	for (const [model, usage] of Object.entries(agg.model_usage).sort((a, b) => b[1].cost - a[1].cost).slice(0, 8)) {
+		lines.push(`| ${model.replace(/.*\./, "")} | $${usage.cost.toFixed(2)} | ${usage.message_count} |`);
+	}
+	if (agg.estimated_waste > 0) lines.push(`\n**Estimated waste from model mismatch:** $${agg.estimated_waste.toFixed(2)}`);
+	lines.push("");
+
+	return lines.join("\n");
 }
 
 function generateHTML(
@@ -2242,6 +2383,11 @@ async function runInsights(
 ): Promise<void> {
 	const refresh = args.includes("--refresh") || args.includes("-r");
 	const noOpen = args.includes("--no-open");
+	const formatMd = args.includes("--format md") || args.includes("--md");
+
+	// Parse --since flag (e.g. --since 7d, --since 14d, --since 30d)
+	const sinceMatch = args.match(/--since\s+(\d+)d/);
+	const sinceDays = sinceMatch ? parseInt(sinceMatch[1]!, 10) : 0;
 
 	if (!ctx.model) {
 		ctx.ui.notify("No active model — set a model first (/model)", "error");
@@ -2337,7 +2483,11 @@ async function runInsights(
 	// Filter substantive sessions (≥2 user messages, ≥1 min)
 	const substantive = metas.filter(
 		(m) => m.user_message_count >= 2 && m.duration_minutes >= 1,
-	);
+	).filter((m) => {
+		if (!sinceDays) return true;
+		const age = Date.now() - new Date(m.start_time).getTime();
+		return age < sinceDays * 86400000;
+	});
 
 	ctx.ui.setWidget("insights", [
 		"",
@@ -2521,6 +2671,15 @@ RESPOND WITH ONLY A VALID JSON OBJECT:
 
 	const html = generateHTML(agg, sectionResults, synthesis, temporal);
 	await writeFile(REPORT_PATH, html, { encoding: "utf-8" });
+
+	if (formatMd) {
+		const md = generateMarkdown(agg, sectionResults, synthesis, temporal);
+		await writeFile(REPORT_MD_PATH, md, { encoding: "utf-8" });
+		ctx.ui.setStatus("insights", "");
+		ctx.ui.setWidget("insights", undefined);
+		ctx.ui.notify(`✅ Markdown report saved: ${REPORT_MD_PATH}`, "success");
+		return;
+	}
 
 	ctx.ui.setStatus("insights", "");
 	ctx.ui.setWidget("insights", undefined);
