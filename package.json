@@ -1,8 +1,8 @@
 {
   "name": "@observal/pi-insights",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "type": "module",
-  "description": "Pi Insights extension \u2014 generates a personal usage insights report from your Pi session history",
+  "description": "Pi Insights extension — generates a personal usage insights report from your Pi session history",
   "author": "Hari Srinivasan <harisrini21@gmail.com>",
   "license": "AGPL-3.0-only",
   "repository": {
