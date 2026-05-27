@@ -250,7 +250,7 @@ type AggregatedData = {
 		sessions_involved: number;
 		user_messages_during: number;
 	};
-	model_usage: Record<string, { input_tokens: number; output_tokens: number; cost: number; message_count: number; sessions: number }>;
+	model_usage: Record<string, { input_tokens: number; output_tokens: number; cost: number; message_count: number; sessions: number; tier?: string }>;
 	model_efficiency: Array<{
 		model: string;
 		session_id: string;
@@ -259,7 +259,7 @@ type AggregatedData = {
 		outcome: string;
 		session_type: string;
 		goal: string;
-		flag: "overspend" | "underspend" | "ok";
+		flag: "overspend" | "underspend" | "quota_pressure" | "ok";
 		reason: string;
 	}>;
 	estimated_waste: number;
@@ -1086,13 +1086,54 @@ function aggregateData(
 	);
 
 	// Model efficiency analysis
-	const MODEL_TIERS: Record<string, "high" | "mid" | "low"> = {};
-	const classifyModel = (name: string): "high" | "mid" | "low" => {
+	// Classify models by observed cost-per-token from actual usage data.
+	// Models with negligible cost-per-token (subscriptions like Mistral Pro, ChatGPT Plus)
+	// are classified as "subscription" and excluded from cost optimization recommendations.
+	const MODEL_TIERS: Record<string, "high" | "mid" | "low" | "subscription"> = {};
+	const MODEL_CPT: Record<string, number> = {}; // cost per 1k tokens
+
+	// Pre-compute cost-per-token for each model across all sessions
+	for (const meta of metas) {
+		for (const [model, usage] of Object.entries(meta.model_usage ?? {})) {
+			const totalTokens = usage.input_tokens + usage.output_tokens;
+			if (totalTokens > 0 && !MODEL_CPT[model]) {
+				// Use aggregate data for a stable estimate
+				const aggUsage = agg.model_usage[model];
+				if (aggUsage) {
+					const aggTotal = aggUsage.input_tokens + aggUsage.output_tokens;
+					if (aggTotal > 0) MODEL_CPT[model] = (aggUsage.cost / aggTotal) * 1000;
+				}
+			}
+		}
+	}
+
+	// Derive tiers from cost-per-token distribution
+	const cptValues = Object.values(MODEL_CPT).filter(v => v > 0);
+	const cptMedian = cptValues.length ? cptValues.sort((a, b) => a - b)[Math.floor(cptValues.length / 2)]! : 0.01;
+
+	const classifyModel = (name: string): "high" | "mid" | "low" | "subscription" => {
 		if (MODEL_TIERS[name]) return MODEL_TIERS[name]!;
-		const n = name.toLowerCase();
-		if (n.includes("opus") || n.includes("o1") || n.includes("o3")) {
+		const cpt = MODEL_CPT[name];
+		// Subscription detection: effectively zero cost-per-token or no cost recorded
+		// despite significant usage (fixed monthly plans)
+		const aggUsage = agg.model_usage[name];
+		if (aggUsage && (aggUsage.input_tokens + aggUsage.output_tokens) > 10000 && aggUsage.cost < 0.01) {
+			MODEL_TIERS[name] = "subscription";
+			return "subscription";
+		}
+		if (!cpt || cpt < 0.001) {
+			// Very low cost, likely subscription or free tier
+			if (aggUsage && aggUsage.message_count > 20) {
+				MODEL_TIERS[name] = "subscription";
+				return "subscription";
+			}
+			MODEL_TIERS[name] = "low";
+			return "low";
+		}
+		// Classify relative to the median observed cost-per-token
+		if (cpt > cptMedian * 3) {
 			MODEL_TIERS[name] = "high";
-		} else if (n.includes("haiku") || n.includes("flash") || n.includes("mini") || n.includes("gpt-4o-mini")) {
+		} else if (cpt < cptMedian * 0.4) {
 			MODEL_TIERS[name] = "low";
 		} else {
 			MODEL_TIERS[name] = "mid";
@@ -1124,22 +1165,51 @@ function aggregateData(
 		const poorOutcome = facets.outcome === "not_achieved" || facets.outcome === "partially_achieved";
 		const goodOutcome = facets.outcome === "fully_achieved" || facets.outcome === "mostly_achieved";
 
-		let flag: "overspend" | "underspend" | "ok" = "ok";
+		let flag: "overspend" | "underspend" | "quota_pressure" | "ok" = "ok";
 		let reason = "";
 
-		// Overspend: expensive model on simple task
-		if (tier === "high" && isSimple && goodOutcome) {
+		// Subscription models: no dollar cost, but quota is finite.
+		// Within a subscription plan, heavier models consume more quota (messages,
+		// tokens, or rate limit budget) than lighter ones. For example:
+		// - Mistral Pro: Medium 3.5 uses more of message quota than Small
+		// - OpenAI Plus: o1/o3 burn cap faster than GPT-4o-mini
+		// - Google: Pro uses more TPM budget than Flash
+		// Flag when a subscription's heavier model is used for trivial tasks.
+		if (tier === "subscription") {
+			if (isSimple && goodOutcome && modelStats.message_count > 3) {
+				// Check if there's a lighter subscription model available from the same provider
+				const modelLower = modelName.toLowerCase();
+				const provider = modelLower.includes("mistral") ? "mistral"
+					: modelLower.includes("gpt") || modelLower.includes("o1") || modelLower.includes("o3") ? "openai"
+					: modelLower.includes("gemini") ? "google"
+					: modelLower.includes("claude") ? "anthropic" : "unknown";
+				
+				// Detect if this is a "heavy" model within its subscription
+				const isHeavySubscription = /medium|large|pro|opus|o[13]/i.test(modelLower)
+					&& !/small|mini|flash|haiku|lite/i.test(modelLower);
+				
+				if (isHeavySubscription) {
+					flag = "quota_pressure";
+					reason = `Used ${modelName} (subscription) for a simple ${facets.session_type}. Within your plan, this model consumes more quota than lighter alternatives. Consider using a smaller model from the same subscription (e.g. ${provider === "mistral" ? "Mistral Small" : provider === "openai" ? "GPT-4o-mini" : provider === "google" ? "Gemini Flash" : "a lighter tier"}) for trivial tasks, or offload to a cheap PAYG model to preserve quota for complex work.`;
+				} else {
+					// Already using a light subscription model for simple tasks: this is fine
+					// No flag needed
+				}
+			}
+		}
+		// PAYG overspend: expensive model on simple task
+		else if (tier === "high" && isSimple && goodOutcome) {
 			flag = "overspend";
-			reason = `Used ${modelName} for a simple ${facets.session_type} that completed successfully. A cheaper model would likely suffice.`;
+			reason = `Used ${modelName} for a simple ${facets.session_type} that completed successfully. A lower-tier model would likely suffice.`;
 			estimatedWaste += modelStats.cost * 0.8;
 		}
-		// Underspend: cheap model on complex task with poor outcome
+		// PAYG underspend: low-tier model on complex task with poor outcome
 		else if (tier === "low" && isComplex && poorOutcome) {
 			flag = "underspend";
-			reason = `Used ${modelName} for a complex ${facets.session_type} that ended with ${facets.outcome}. A stronger model may have succeeded.`;
+			reason = `Used ${modelName} for a complex ${facets.session_type} that ended with ${facets.outcome}. A more capable model may have succeeded.`;
 			estimatedWaste += modelStats.cost;
 		}
-		// Overspend: expensive model on ANY task with poor outcome (wasted tokens)
+		// PAYG overspend: expensive model on ANY task with poor outcome (wasted tokens)
 		else if (tier === "high" && poorOutcome && modelStats.cost > 0.10) {
 			flag = "overspend";
 			reason = `Spent $${modelStats.cost.toFixed(2)} on ${modelName} but outcome was ${facets.outcome}. Tokens were burned without reaching the goal.`;
@@ -1164,6 +1234,11 @@ function aggregateData(
 	agg.estimated_waste = estimatedWaste;
 	agg.model_efficiency.sort((a, b) => b.cost - a.cost);
 	agg.model_efficiency = agg.model_efficiency.slice(0, 20);
+
+	// Annotate model_usage with tier info for downstream prompts
+	for (const [model, usage] of Object.entries(agg.model_usage)) {
+		usage.tier = MODEL_TIERS[model] || "mid";
+	}
 
 	return agg;
 }
@@ -1318,7 +1393,7 @@ const PI_FEATURES_REFERENCE = `## PI FEATURES REFERENCE:
 6. Settings (settings.json) — default model, packages, custom providers
    - Good for: standardizing across projects, pinning a model, enabling packages`;
 
-function buildSectionPrompts(data: string, temporal: TemporalData, userCtx: UserContext) {
+function buildSectionPrompts(data: string, temporal: TemporalData, userCtx: UserContext, agg: AggregatedData) {
 	return {
 		project_areas: `Analyze this usage data and identify project areas.
 
@@ -1482,24 +1557,41 @@ Find something interesting or amusing. Avoid generic observations.
 DATA:
 ${data}`,
 
-		model_efficiency: `Analyze this model usage data and identify efficiency issues.
+		model_efficiency: (() => {
+			const modelLines = Object.entries(agg.model_usage).sort((a, b) => b[1].cost - a[1].cost).map(([m, u]) => {
+				const totalTok = u.input_tokens + u.output_tokens;
+				const cpt = totalTok > 0 ? (u.cost / totalTok * 1000).toFixed(4) : "0";
+				return `- ${m.replace(/.*\./, "")}: ${u.sessions} sessions, $${u.cost.toFixed(2)} total, ${u.message_count} msgs, tier=${u.tier || "mid"}, $/1k-tok=${cpt}`;
+			}).join("\n");
+			return `Analyze this model usage data and identify efficiency issues.
 
-Model tiers:
-- HIGH cost: Opus, o1, o3 (best quality, most expensive)
-- MID cost: Sonnet, GPT-4o, Gemini Pro (good balance)
-- LOW cost: Haiku, Flash, Mini (cheap, less capable)
+IMPORTANT CONTEXT:
+- Model tiers are derived from observed cost-per-token in the user's actual usage
+- Models marked as "subscription" are on fixed monthly plans (e.g. Mistral Pro, ChatGPT Plus, Gemini Advanced). Their effective dollar cost per token is $0. Do NOT recommend switching away from subscription models to "save money."
+- However, subscriptions have finite quotas (rate limits, daily message caps, monthly token budgets). Within a subscription, heavier models consume more quota than lighter ones:
+  * Mistral Pro: Medium 3.5 uses more message budget than Small or Codestral
+  * OpenAI Plus: o1/o3 burn cap faster than GPT-4o or GPT-4o-mini
+  * Google: Gemini Pro uses more TPM than Flash
+  * Anthropic: Opus uses more quota than Sonnet or Haiku
+- For subscription models: suggest using lighter models within the same plan for trivial tasks, reserving the heavy model for complex work.
+- For PAYG models: optimize for dollar cost as usual.
+
+The user's models from their sessions (derived from actual usage data):
+${modelLines}
 
 RESPOND WITH ONLY A VALID JSON OBJECT:
 {
-  "summary": "2-3 sentences summarizing model usage efficiency. Use 'you'. Be direct about waste.",
-  "overspend_pattern": "1-2 sentences about when expensive models are used unnecessarily, or empty string if none",
-  "underspend_pattern": "1-2 sentences about when cheap models fail on complex tasks, or empty string if none",
-  "recommendation": "1-2 sentences with a specific model selection strategy for this user",
-  "potential_savings_note": "1 sentence about how much could be saved with better model selection"
+  "summary": "2-3 sentences summarizing model usage efficiency. Use 'you'. Be direct. Distinguish between dollar waste (PAYG) and quota waste (subscription).",
+  "overspend_pattern": "1-2 sentences about when expensive PAYG models are used unnecessarily, or empty string if none. Never flag subscription models as dollar overspend.",
+  "underspend_pattern": "1-2 sentences about when weaker models fail on complex tasks, or empty string if none",
+  "quota_pressure": "1-2 sentences about subscription quota being burned by heavy models on trivial tasks. Suggest lighter models within the same subscription, or offloading to cheap PAYG. Empty string if no subscription models detected or if they're already using light subscription models.",
+  "recommendation": "1-2 sentences with a specific model selection strategy. Reference the user's actual models by name. For subscriptions: use light models for simple tasks, reserve heavy ones for complex work. For PAYG: match tier to task complexity.",
+  "potential_savings_note": "1 sentence about realistic savings. If most usage is subscription, frame as 'quota preservation' or 'extending your monthly budget' rather than dollar savings."
 }
 
 DATA:
-${data}`,
+${data}`;
+		})(),
 	};
 }
 
@@ -1859,7 +1951,7 @@ function generateHTML(
 		| { headline?: string; detail?: string }
 		| undefined;
 	const modelEffSec = sections.model_efficiency as
-		| { summary?: string; overspend_pattern?: string; underspend_pattern?: string; recommendation?: string; potential_savings_note?: string }
+		| { summary?: string; overspend_pattern?: string; underspend_pattern?: string; quota_pressure?: string; recommendation?: string; potential_savings_note?: string }
 		| undefined;
 
 	const topTools = top8(agg.tool_counts);
@@ -2276,7 +2368,7 @@ ${temporal.diff_headlines.length ? `
 
   <div class="stat-grid">
     ${statCard("Estimated Waste", fmtCost(agg.estimated_waste), "from model mismatch")}
-    ${statCard("Efficiency Flags", String(agg.model_efficiency.length), `${agg.model_efficiency.filter(e => e.flag === "overspend").length} overspend, ${agg.model_efficiency.filter(e => e.flag === "underspend").length} underspend`)}
+    ${statCard("Efficiency Flags", String(agg.model_efficiency.length), `${agg.model_efficiency.filter(e => e.flag === "overspend").length} overspend, ${agg.model_efficiency.filter(e => e.flag === "underspend").length} underspend, ${agg.model_efficiency.filter(e => e.flag === "quota_pressure").length} quota pressure`)}
     ${statCard("Models Used", String(Object.keys(agg.model_usage).length), "")}
   </div>
 
@@ -2300,6 +2392,11 @@ ${temporal.diff_headlines.length ? `
   ${modelEffSec?.underspend_pattern ? `<div class="card" style="margin-top:12px;border-left:3px solid var(--red)">
     <h3 style="color:var(--red);font-size:14px">Underspend Pattern</h3>
     <p style="color:var(--dim);margin-top:8px">${esc(modelEffSec.underspend_pattern)}</p>
+  </div>` : ""}
+
+  ${modelEffSec?.quota_pressure ? `<div class="card" style="margin-top:12px;border-left:3px solid var(--blue)">
+    <h3 style="color:var(--blue);font-size:14px">Subscription Quota Pressure</h3>
+    <p style="color:var(--dim);margin-top:8px">${esc(modelEffSec.quota_pressure)}</p>
   </div>` : ""}
 
   ${modelEffSec?.recommendation ? `<div class="card" style="margin-top:12px;border-left:3px solid var(--green)">
@@ -2607,7 +2704,7 @@ RESPOND WITH ONLY A VALID JSON OBJECT:
 	const temporal = computeTemporalData(kept, facetsMap);
 	const userCtx = await gatherUserContext();
 	const dataBlock = buildSharedDataBlock(agg, temporal, userCtx);
-	const sectionPrompts = buildSectionPrompts(dataBlock, temporal, userCtx);
+	const sectionPrompts = buildSectionPrompts(dataBlock, temporal, userCtx, agg);
 
 	const sectionKeys = Object.keys(sectionPrompts) as Array<
 		keyof typeof sectionPrompts
